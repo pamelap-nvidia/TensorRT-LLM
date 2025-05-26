@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -85,11 +87,14 @@ class MnnvlMemory:
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device='cuda')
-            # ensure nvml is initialized.
-            try:
-                pynvml.nvmlDeviceGetCount()
-            except pynvml.NVMLError_Uninitialized:
-                pynvml.nvmlInit()
+            if MnnvlMemory.supports_mnnvl():
+                # ensure nvml is initialized.
+                try:
+                    pynvml.nvmlDeviceGetCount()
+                except pynvml.NVMLError_Uninitialized:
+                    pynvml.nvmlInit()
+            elif MnnvlMemory.supports_pcie():
+                pass
             MnnvlMemory.initialized = True
 
     @staticmethod
@@ -109,7 +114,10 @@ class MnnvlMemory:
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        if MnnvlMemory.supports_mnnvl():
+            allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        else:
+            allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         allocation_prop.location = location
         return allocation_prop
 
@@ -160,7 +168,24 @@ class MnnvlMemory:
         assert all(
             x == size for x in
             all_rank_allocate_sizes), "Not all rank allocating same size."
-        granularity = MnnvlMemory.get_allocation_granularity(dev_id)
+
+        # Load CUDA runtime library
+        libcudart = ctypes.CDLL("libcudart.so")
+        status_cudaSuccess = 0
+        status_cudaErrorPeerAccessAlreadyEnabled = 704
+        # Enable P2P access from current rank to all other ranks
+        for dst_rank in range(comm_size):
+            if dst_rank != dev_id:
+                if torch.cuda.can_device_access_peer(dev_id, dst_rank):
+                    logger.debug(
+                        f"Rank {comm_rank}: enabling peer access to rank {dst_rank}"
+                    )
+                    result = libcudart.cudaDeviceEnablePeerAccess(
+                        ctypes.c_int(dst_rank), ctypes.c_uint(0))
+                    assert result == status_cudaSuccess or result == status_cudaErrorPeerAccessAlreadyEnabled, \
+                        "Failed to enable peer access from dev_id=%d to dst_rank=%d" % (dev_id, dst_rank)
+
+        granularity = MnnvlMemory.get_allocation_granularity(comm_rank)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
         if MnnvlMemory.current_mem_offset + aligned_size > MnnvlMemory.current_rank_stride:
@@ -168,14 +193,58 @@ class MnnvlMemory:
 
         assert MnnvlMemory.current_mem_offset + aligned_size <= MnnvlMemory.current_rank_stride
 
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
+        allocation_prop = MnnvlMemory.get_allocation_prop(comm_rank)
         allocated_mem_handle = _check_cu_result(
             cuda.cuMemCreate(aligned_size, allocation_prop, flags=0))
         exported_fabric_handle = _check_cu_result(
             cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle,
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0))
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0))
+
+        all_handles_data = comm.allgather(exported_fabric_handle)
+        all_pids = comm.allgather(os.getpid())
+        syscall = ctypes.CDLL(None).syscall
+        SYS_pidfd_open = 434
+        SYS_pidfd_getfd = 438
+        # pidfds = [syscall(SYS_pidfd_open, pid, 0) for pid in all_pids]
+        # remote_fds = [syscall(SYS_pidfd_getfd, pidfd, fd, 0) for pidfd, fd in zip(pidfds, all_handles_data)]
+
+        pidfds = []
+        for i, pid in enumerate(all_pids):
+            try:
+                pidfd = syscall(SYS_pidfd_open, pid, 0)
+                pidfds.append(pidfd)
+                print(f"Rank {comm_rank}: pidfd_open({pid}) = {pidfd}")
+                if pidfd < 0:
+                    print(
+                        f"Rank {comm_rank}: pidfd_open failed with errno: {ctypes.get_errno()}"
+                    )
+            except Exception as e:
+                print(f"Rank {comm_rank}: pidfd_open exception: {e}")
+                pidfds.append(-1)
+            # Try to get remote FDs
+        remote_fds = []
+        for i, (pidfd, remote_fd) in enumerate(zip(pidfds, all_handles_data)):
+            if pidfd < 0:
+                remote_fds.append(-1)
+                continue
+
+            try:
+                # Clear errno before syscall
+                ctypes.set_errno(0)
+                new_fd = syscall(SYS_pidfd_getfd, pidfd, remote_fd, 0)
+                remote_fds.append(new_fd)
+                print(
+                    f"Rank {comm_rank}: pidfd_getfd({pidfd}, {remote_fd}) = {new_fd}"
+                )
+                if new_fd < 0:
+                    err = ctypes.get_errno()
+                    print(
+                        f"Rank {comm_rank}: pidfd_getfd failed with errno {err}: {os.strerror(err)}"
+                    )
+            except Exception as e:
+                print(f"Rank {comm_rank}: pidfd_getfd exception: {e}")
+                remote_fds.append(-1)
+        all_handles_data = remote_fds
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -197,8 +266,8 @@ class MnnvlMemory:
                 # Fabric memory mapping
                 imported_mem_handle = _check_cu_result(
                     cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, cuda.CUmemAllocationHandleType.
-                        CU_MEM_HANDLE_TYPE_FABRIC))
+                        remote_handle_data,
+                        allocation_prop.requestedHandleTypes))
                 mem_handles[i] = imported_mem_handle
                 _check_cu_result(
                     cuda.cuMemMap(rank_ptr, aligned_size, 0,
@@ -272,6 +341,10 @@ class MnnvlMemory:
         is_on_aarch64 = 'aarch64' in arch
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
         return is_on_aarch64 and support_nvlink_and_all_up
+
+    @staticmethod
+    def supports_pcie() -> bool:
+        return True
 
 
 @dataclass
