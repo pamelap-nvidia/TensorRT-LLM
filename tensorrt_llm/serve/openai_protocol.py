@@ -12,6 +12,7 @@ from openai.types.chat import \
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import Annotated, Required, TypedDict
 
+from tensorrt_llm.executor.serialization import register_approved_ipc_class
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 
@@ -19,6 +20,14 @@ from tensorrt_llm.llmapi import GuidedDecodingParams, SamplingParams
 class OpenAIBaseModel(BaseModel):
     # OpenAI API does not allow extra fields & allow to initialize by both alias and field name
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    def __init_subclass__(cls, **kwargs):
+        """
+        This method is called when a class inherits from OpenAIBaseModel.
+        """
+        # Register subclass as an approved class for deserialization across IPC boundaries.
+        super().__init_subclass__(**kwargs)
+        register_approved_ipc_class(cls)
 
 
 class StreamOptions(OpenAIBaseModel):
@@ -104,6 +113,9 @@ class CompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
+    # Add prompt_tokens_ids to the response to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[List[int]]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -156,7 +168,7 @@ class CompletionRequest(OpenAIBaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
-    max_tokens: Optional[int] = 16
+    max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
     seed: Optional[int] = Field(default=None)
@@ -371,6 +383,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     model: str
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
+    # Add prompt_tokens_ids to the response to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[int]] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -421,12 +436,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: List[ChatCompletionMessageParam]
+    # Add prompt_tokens_ids to the request to remove the tokenization
+    # in the generation server in disaggreated serving
+    prompt_token_ids: Optional[List[int]] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     logprobs: Optional[int] = None
     top_logprobs: Optional[int] = 0
-    max_completion_tokens: int = Field(default=16,
+    max_completion_tokens: int = Field(default=None,
                                        validation_alias='max_tokens')
     n: Optional[int] = 1
     presence_penalty: Optional[float] = 0.0
