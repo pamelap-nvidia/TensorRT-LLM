@@ -87,14 +87,14 @@ class MnnvlMemory:
         if not MnnvlMemory.initialized:
             # use a dummy torch CUDA tensor to trigger CUDA context initialization
             _ = torch.empty(1, device='cuda')
-            if MnnvlMemory.supports_mnnvl():
-                # ensure nvml is initialized.
-                try:
-                    pynvml.nvmlDeviceGetCount()
-                except pynvml.NVMLError_Uninitialized:
-                    pynvml.nvmlInit()
-            elif MnnvlMemory.supports_pcie():
-                pass
+            # if MnnvlMemory.supports_mnnvl():
+            #     # ensure nvml is initialized.
+            #     try:
+            #         pynvml.nvmlDeviceGetCount()
+            #     except pynvml.NVMLError_Uninitialized:
+            #         pynvml.nvmlInit()
+            # elif MnnvlMemory.supports_pcie():
+            #     pass
             MnnvlMemory.initialized = True
 
     @staticmethod
@@ -114,10 +114,10 @@ class MnnvlMemory:
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        if MnnvlMemory.supports_mnnvl():
-            allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        else:
-            allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        # if MnnvlMemory.supports_mnnvl():
+        # allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        # else:
+        allocation_prop.requestedHandleTypes = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
         allocation_prop.location = location
         return allocation_prop
 
@@ -333,6 +333,7 @@ class MnnvlMemory:
 
     @staticmethod
     def supports_mnnvl() -> bool:
+        return True
         # TODO:
         # We check if it is an aarch64 platform and has all NVLink up now.
         # But it is not equivalent to MNNVL support.

@@ -354,6 +354,9 @@ class Deepseekv3MoE(nn.Module):
             model_config, top_k)
         if self.enable_alltoall:
             MnnvlMemory.initialize()
+            print("======enabling alltoall=======")
+        else:
+            print("======not enabling alltoall=======")
         self.gate = DeepseekV3Gate(
             hidden_size,
             num_experts,
@@ -455,8 +458,8 @@ class Deepseekv3MoE(nn.Module):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return False
 
-        if model_config.mapping.moe_ep_size <= top_k:
-            return False
+        # if model_config.mapping.moe_ep_size <= top_k:
+        #     return False
 
         return True
 
