@@ -1903,6 +1903,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 @pytest.mark.parametrize("modality", ["image", "video"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
+    ("NVILA-15B-FP16", "NVILA-15B"),
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
