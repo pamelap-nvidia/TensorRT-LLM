@@ -51,6 +51,8 @@ MODEL_PATH_DICT = {
     "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
     "llama_v3.3_70b_instruct_fp8":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+    "llama_v3.3_70b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
     "llama_v3.1_405b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
@@ -58,12 +60,17 @@ MODEL_PATH_DICT = {
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
     "llama_v3.3_nemotron_super_49b":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b-fp8":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
     "llama_v3.1_nemotron_ultra_253b":
     "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
     "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
+    "mixtral_8x7b_v0.1_instruct_fp4": "nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1",
+    "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
+    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
