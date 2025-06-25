@@ -8,5 +8,12 @@ test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-FP8-nemotron-nas
 test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-NVFP4-nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1]
 test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-FP8-Mixtral-8x7B-Instruct-v0.1-fp8]
 test_e2e.py::test_ptp_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP8-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP4-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-BF16-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1]
+test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-BF16-Mixtral-8x7B-Instruct-v0.1]
+test_e2e.py::test_ptp_quickstart_advanced[Mistral-Nemo-12b-Base-Mistral-Nemo-Base-2407]
+test_e2e.py::test_ptp_quickstart_advanced[DeepSeek-R1-Distill-Qwen-32B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B]
+
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-15B-FP16-NVILA-15B-image]
 test_e2e.py::test_ptp_quickstart_multimodal[NVILA-15B-FP16-NVILA-15B-video]
