@@ -538,7 +538,7 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     {
         return {};
     }
-    if (sm == 120 && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>())
+    if ((sm == 120 || sm == 121) && !kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>())
     {
         return {};
     }
@@ -565,7 +565,7 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpe
 {
     return (sm_ == 90 && kernels::cutlass_kernels::isValidHopperMOESpecialisation<T, WeightType>())
         || (sm_ >= 100 && sm_ < 120 && kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<T, WeightType>())
-        || (sm_ == 120 && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
+        || ((sm_ == 120 || sm_ == 121) && kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>

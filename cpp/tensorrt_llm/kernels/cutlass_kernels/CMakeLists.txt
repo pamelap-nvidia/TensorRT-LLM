@@ -193,9 +193,10 @@ function(process_target target_name enable_hopper enable_blackwell)
                                PRIVATE COMPILE_HOPPER_TMA_GROUPED_GEMMS)
   endif()
 
-  if(${enable_blackwell} AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-                              OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-                              OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+  if(${enable_blackwell}
+     AND ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
 
     if("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       # No kernels should be parsed, unless blackwell is specified. This is a
@@ -204,6 +205,13 @@ function(process_target target_name enable_hopper enable_blackwell)
                                  PRIVATE COMPILE_BLACKWELL_TMA_GEMMS)
       target_compile_definitions(${target_name}
                                  PRIVATE COMPILE_BLACKWELL_TMA_GROUPED_GEMMS)
+    endif()
+    if("120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+       OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      target_compile_definitions(${target_name}
+                                 PRIVATE COMPILE_BLACKWELL_SM120_TMA_GEMMS)
+      target_compile_definitions(
+        ${target_name} PRIVATE COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS)
     endif()
   endif()
 
