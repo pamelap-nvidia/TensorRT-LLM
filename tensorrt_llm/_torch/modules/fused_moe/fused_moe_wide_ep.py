@@ -249,8 +249,8 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if mapping.moe_ep_size <= top_k:
-            return AlltoallMethodType.NotEnabled
+        #if mapping.moe_ep_size <= top_k:
+        #    return AlltoallMethodType.NotEnabled
 
         if MnnvlMemory.supports_mnnvl():
             return AlltoallMethodType.MNNVL
@@ -733,6 +733,8 @@ class WideEPMoE(MoE):
         else:
             all_rank_num_tokens_padded = all_rank_num_tokens
         if num_chunks == 1:
+            use_all_to_all = self.can_use_alltoall(x)
+
             is_first_call = self.repeat_idx == 0
             is_last_call = self.repeat_idx == self.repeat_count - 1
             outputs = self.forward_chunk(
@@ -751,6 +753,7 @@ class WideEPMoE(MoE):
                 use_dp_padding=use_dp_padding)
         else:
 
+            use_all_to_all = False
             def split_chunk(split_token_num: int, split_num_chunks: int):
                 val_div = split_token_num // split_num_chunks
                 val_mod = split_token_num % split_num_chunks
