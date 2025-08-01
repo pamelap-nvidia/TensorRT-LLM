@@ -140,7 +140,8 @@ class VariableLengthLowLatencyBuffer:
                              hidden_states: torch.Tensor,
                              topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int,
-                             num_experts: int):
+                             num_experts: int,
+                             use_hook: bool = False):
         assert num_experts == self.num_experts
 
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
