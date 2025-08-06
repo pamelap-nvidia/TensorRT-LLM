@@ -384,18 +384,6 @@ class WideEPMoE(MoE):
 
         # If alltoall is disabled, we need also disable use_postquant_alltoall
         use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
-        # Prepare additional information for profiling in case padding is applied when using alltoall.
-        # Only the non-alltoall case is considered for profiling in the warmup phase.
-        # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
-        if use_all_to_all:
-            if all_rank_num_tokens is not None:
-                tuner_num_tokens = sum(all_rank_num_tokens)
-            else:
-                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
-            tuner_top_k = token_selected_slots.shape[1]
-        else:
-            tuner_num_tokens = None
-            tuner_top_k = None
 
         def dispatch(chunk_idx,
                      x,
@@ -579,8 +567,6 @@ class WideEPMoE(MoE):
                 use_w4a8_group_scaling=use_w4a8_group_scaling,
                 min_latency_mode=False,
                 tune_max_num_tokens=self.tune_max_num_tokens,
-                tuner_num_tokens=tuner_num_tokens,
-                tuner_top_k=tuner_top_k,
             )
 
             return final_hidden_states
@@ -604,11 +590,11 @@ class WideEPMoE(MoE):
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
+                final_hidden_states, hook = self.deep_ep_buffer.low_latency_combine(
                     final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights,
                     deep_ep_handle, use_hook=use_hook)
 
-            return final_hidden_states
+            return final_hidden_states, hook
 
         if self.num_chunk_experts == 1:
             x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights, _ = dispatch(
@@ -628,65 +614,47 @@ class WideEPMoE(MoE):
                                              use_hook=False)
         else:
             final_hidden_states = []
-            x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, _ = dispatch(
+            x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, dispatch_hook = dispatch(
                 0,
                 x.clone(),
                 token_selected_slots.clone(),
                 token_final_scales.clone(),
                 self.deep_ep_buffer,
-                use_hook=False)
-            self.event_dict[EventType.Main].record()
-
-            for chunk_idx in range(self.num_chunk_experts):
-                if chunk_idx % 2 == 0:
-                    if chunk_idx > 0:
-                        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, _ = dispatch(
-                            chunk_idx,
-                            x.clone(),
-                            token_selected_slots.clone(),
-                            token_final_scales.clone(),
-                            self.deep_ep_buffer,
-                            use_hook=False)
-                    chunked_final_hidden_states = compute(
-                        x_chunked, x_sf_chunked, token_selected_slots_chunked,
-                        token_final_scales_chunked)
-                    chunked_final_hidden_states, _ = combine(
-                        chunked_final_hidden_states,
-                        deep_ep_handle_chunked,
-                        deep_ep_topk_idx_chunked,
-                        deep_ep_topk_weights_chunked,
-                        self.deep_ep_buffer,
-                        use_hook=False)
-                    final_hidden_states.append(chunked_final_hidden_states)
-                else:
-                    if chunk_idx == 1:
-                        with torch.cuda.stream(self.aux_stream):
-                            self.event_dict[EventType.Main].wait()
-                    with torch.cuda.stream(self.aux_stream):
-                        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, _ = dispatch(
-                            chunk_idx,
-                            x.clone(),
-                            token_selected_slots.clone(),
-                            token_final_scales.clone(),
-                            self.deep_ep_buffer_aux,
-                            use_hook=False)
-                        chunked_final_hidden_states = compute(
-                            x_chunked, x_sf_chunked,
-                            token_selected_slots_chunked,
-                            token_final_scales_chunked)
-                        chunked_final_hidden_states, _ = combine(
-                            chunked_final_hidden_states,
-                            deep_ep_handle_chunked,
-                            deep_ep_topk_idx_chunked,
-                            deep_ep_topk_weights_chunked,
-                            self.deep_ep_buffer_aux,
-                            use_hook=False)
-                        final_hidden_states.append(chunked_final_hidden_states)
-                        if chunk_idx == self.num_chunk_experts - 1:
-                            self.event_dict[
-                                EventType.MoeChunkingOverlap].record()
-
-            self.event_dict[EventType.MoeChunkingOverlap].wait()
+                use_hook=True)
+            dispatch_hook()
+            x_chunked1, x_sf_chunked1, token_selected_slots_chunked1, token_final_scales_chunked1, deep_ep_handle_chunked1, deep_ep_topk_idx_chunked1, deep_ep_topk_weights_chunked1, dispatch_hook1 = dispatch(
+                1,
+                x.clone(),
+                token_selected_slots.clone(),
+                token_final_scales.clone(),
+                self.deep_ep_buffer_aux,
+                use_hook=True)
+            chunked_final_hidden_states = compute(
+                x_chunked, x_sf_chunked, token_selected_slots_chunked,
+                token_final_scales_chunked)
+            dispatch_hook1()
+            chunked_final_hidden_states, combine_hook = combine(
+                chunked_final_hidden_states,
+                deep_ep_handle_chunked,
+                deep_ep_topk_idx_chunked,
+                deep_ep_topk_weights_chunked,
+                self.deep_ep_buffer,
+                use_hook=True)
+            chunked_final_hidden_states1 = compute(
+                x_chunked1, x_sf_chunked1, token_selected_slots_chunked1,
+                token_final_scales_chunked1)
+            combine_hook()
+            chunked_final_hidden_states1, combine_hook1 = combine(
+                chunked_final_hidden_states1,
+                deep_ep_handle_chunked1,
+                deep_ep_topk_idx_chunked1,
+                deep_ep_topk_weights_chunked1,
+                self.deep_ep_buffer_aux,
+                use_hook=True)
+            combine_hook1()
+            final_hidden_states.append(chunked_final_hidden_states)
+            final_hidden_states.append(chunked_final_hidden_states1)
+            # self.event_dict[EventType.MoeChunkingOverlap].wait()
             final_hidden_states = torch.stack(final_hidden_states,
                                               dim=0).sum(dim=0)
 
