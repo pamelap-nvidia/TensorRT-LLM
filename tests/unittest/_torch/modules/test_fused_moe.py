@@ -220,7 +220,9 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
+    pytest.param(AlltoallMethodType.NVLinkTwoSided,
+                 marks=skip_blackwell_geforce),
+    pytest.param(AlltoallMethodType.DeepEP, marks=skip_blackwell_geforce),
     AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
@@ -333,7 +335,9 @@ def test_fused_moe_alltoall(alltoall_method_type):
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
-    AlltoallMethodType.NVLinkTwoSided, AlltoallMethodType.DeepEP,
+    pytest.param(AlltoallMethodType.NVLinkTwoSided,
+                 marks=skip_blackwell_geforce),
+    pytest.param(AlltoallMethodType.DeepEP, marks=skip_blackwell_geforce),
     AlltoallMethodType.DeepEPLowLatency
 ],
                          ids=lambda s: s.name)
@@ -690,6 +694,7 @@ def set_tensor_value_4(x, num_row, num_cols):
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize(
@@ -845,6 +850,7 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
     product(
@@ -1040,6 +1046,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1339,6 +1346,7 @@ def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -1674,6 +1682,7 @@ def run_fused_moe_nvfp4(dtype,
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
@@ -2094,6 +2103,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 
 
 @skip_pre_blackwell
+@skip_blackwell_geforce
 @pytest.mark.parametrize(
     "moe_backend",
     [pytest.param("TRTLLM", marks=skip_blackwell_geforce), "CUTLASS"])
@@ -2357,6 +2367,7 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
             torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
+@skip_blackwell_geforce
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [768, 2880])
 @pytest.mark.parametrize(
@@ -2365,9 +2376,7 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias,
         # smVersion
         pytest.param("TRTLLM",
                      marks=[skip_blackwell_geforce, skip_pre_blackwell]),
-        pytest.param(
-            "CUTLASS",
-            marks=[skip_pre_hopper, skip_blackwell, skip_blackwell_geforce]),
+        pytest.param("CUTLASS", marks=[skip_pre_hopper, skip_blackwell]),
     ],
 )
 @pytest.mark.parametrize("enable_configurable_moe", [0, 1],

@@ -74,8 +74,7 @@ class TestMixtral(unittest.TestCase):
         if quant_algo == "FP8" and getSMVersion() < 90:
             self.skipTest(
                 "This test is not supported in pre-Hopper architecture")
-        if quant_algo == "NVFP4" and (getSMVersion() < 100
-                                      or getSMVersion() >= 120):
+        if quant_algo == "NVFP4" and getSMVersion() < 100:
             self.skipTest(
                 "This test is not supported in pre-Blackwell architecture, nor GeForce Blackwell"
             )

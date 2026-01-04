@@ -38,6 +38,8 @@ import tqdm
 import yaml
 from _pytest.mark import ParameterSet
 
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
+    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
@@ -1989,6 +1991,27 @@ def skip_fp4_pre_blackwell(use_fp4):
     "skip fp4 tests if sm version less than 10.0 or greater or equal to 12.0"
     if use_fp4 and (get_sm_version() < 100 or get_sm_version() >= 120):
         pytest.skip("FP4 is not supported on pre-Blackwell architectures")
+
+
+def skip_unsupported_moe_backends(moe_backend):
+    "skip moe backends for pre-blackwell or post-blackwell-ultra architectures"
+    sm_version = get_sm_version()
+    moe_backend = moe_backend.upper()
+    if moe_backend == "CUTEDSL":
+        if sm_version not in (100, 103):
+            pytest.skip("CUTEDSL MOE backend supports SM 100 and 103 only")
+    elif moe_backend == "DEEPGEMM":
+        if sm_version in (120, 121):
+            pytest.skip(
+                "DEEPGEMM MOE backend is not supported on SM120 or SM121")
+    elif moe_backend == "TRITON":
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("TRITON moe backend is not available.")
+        if sm_version < 90:
+            pytest.skip("TRITON moe backend requires Hopper or newer.")
+    elif moe_backend == "TRTLLM":
+        if sm_version in (120, 121):
+            pytest.skip("TRTLLM MOE backend is not supported on SM120 or SM121")
 
 
 @pytest.fixture(autouse=True)
