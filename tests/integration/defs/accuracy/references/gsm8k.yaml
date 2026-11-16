@@ -393,6 +393,15 @@ google/gemma-3n-E2B-it:
   - accuracy: 72.176
 google/gemma-4-E2B-it:
   - accuracy: 85.709
+  # ModelOpt FP8 text-only checkpoint (FP8 lm_head), FP8 KV, chat template, zero-shot, strict lm-eval
+  # extraction (the modeling_v2 e2b_it_fp8__sm_120__tp1 protocol). Modeling V1 on RTX PRO 6000: 37.263.
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 37.263
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 37.263
 swiss-ai/Apertus-8B-Instruct-2509:
   - accuracy: 57.56
 swiss-ai/Apertus-v1.5-8B:

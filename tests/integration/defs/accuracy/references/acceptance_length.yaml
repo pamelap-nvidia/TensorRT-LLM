@@ -146,6 +146,10 @@ TestGLM53FlashFP8::test_mtp:
 TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused::test_gsm8k_mtp:
   ref_al: 3.396
   min_al: 3.226
+# RTX PRO 6000, ModelOpt FP8 E2B-it text checkpoint, FP8 KV, Gemma-4 assistant, 5 drafts, overlap scheduler.
+TestModelingV2Gemma4E2bItFp8Sm120Tp1::test_gsm8k_mtp:
+  ref_al: null
+  min_al: null
 # Measured on B200, 1P1D TP1 with target and draft KV in one manager.
 # min_al is 95% of the measured value.
 TestQwen3_8BDFlash::test_gsm8k_1p1d_unified_draft_kv:
