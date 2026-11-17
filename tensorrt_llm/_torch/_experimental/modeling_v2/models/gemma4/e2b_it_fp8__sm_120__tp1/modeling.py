@@ -14,7 +14,8 @@ double-wide MLP.
   launch of the decoder-stack megakernel (``ops/decode_stack.py``, native code in ``csrc/``) computes the PLE
   projection, the 35 layers and the final norm, reading and writing the paged FP8 KV in place.
 * Everything else (prefill, mixed batches): the same math layer by layer with PyTorch ops, FP8 ``_scaled_mm``
-  and this target's Triton paged-KV append and attention (``ops/paged_kv.py``).
+  and this target's Triton paged-KV append and attention (``ops/paged_kv.py``). Layers 15-34 write no KV, so
+  they run only on the rows the step reads: each context request's last prompt row and the generation rows.
 
 **Speculative decoding runs in the model.** With one-model MTP and the Gemma-4 assistant checkpoint
 (``Gemma4AssistantForCausalLM``: 4 Q-only layers of width 256 that read the target's committed KV of layers 13 and
@@ -264,6 +265,8 @@ class Gemma4E2bModel(DecoderModel):
         self._kv: _KvView | None = None
         self._stack_weights: list[torch.Tensor] | None = None
         self._validate = step_contract_enabled()
+        # Prefill runs the KV-shared layers 15-34 on the rows the step reads only (``shared_kv_rows``).
+        self.skip_shared_kv_layers = True
 
     def post_load_weights(self) -> None:
         device = self.w["embed_tokens"].device
@@ -289,8 +292,11 @@ class Gemma4E2bModel(DecoderModel):
         input_ids: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        all_rows: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """Final hidden states ``[T, 1536]``. Unless ``all_rows``, a prefill / mixed step computes only the rows the
+        step reads -- each context request's last row and every generation row -- and leaves the others zero."""
         assert input_ids is not None and inputs_embeds is None, "the target embeds token ids itself"
         md = attn_metadata
         num_tokens = input_ids.shape[0]
@@ -313,7 +319,7 @@ class Gemma4E2bModel(DecoderModel):
             "the layer-by-layer path builds its block tables on the host and is not CUDA-graph capturable; "
             f"got a captured step with {md.num_contexts} contexts and {num_tokens} tokens for {num_requests} requests"
         )
-        return self._layers(md, kv, hidden, ple_tokens, positions)
+        return self._layers(md, kv, hidden, ple_tokens, positions, all_rows)
 
     # -- decode: the megakernel ----------------------------------------------
 
@@ -344,91 +350,161 @@ class Gemma4E2bModel(DecoderModel):
 
     # -- prefill / mixed: layer by layer -------------------------------------
 
-    def _layers(self, md, kv: _KvView, hidden, ple_tokens, positions) -> torch.Tensor:
-        w = self.w
-        rope = self._rope
-        num_tokens = hidden.shape[0]
-        device = hidden.device
-        seq_lens = md.seq_lens[: md.num_seqs].tolist()
-        assert sum(seq_lens) == num_tokens, (seq_lens, num_tokens)
-        token_req = torch.repeat_interleave(
+    def _layers(self, md, kv: _KvView, hidden, ple_tokens, positions, all_rows) -> torch.Tensor:
+        tables = {True: kv.page_table(md, sliding=True), False: kv.page_table(md, sliding=False)}
+        return prefill_layers(
+            self.w,
+            self._rope,
+            kv.caches,
+            tables,
+            kv.request_starts(md),
+            md.seq_lens[: md.num_seqs].tolist(),
+            md.num_contexts,
+            hidden,
+            ple_tokens,
+            positions,
+            skip_shared_kv_layers=self.skip_shared_kv_layers and not all_rows,
+        )
+
+
+class _StepRows:
+    """The host-built row layout of one layer-by-layer pass: each row's request and, per head_dim, the attention
+    block table and its tokens per block."""
+
+    def __init__(self, seq_lens: list[int], device: torch.device):
+        self.num_rows = sum(seq_lens)
+        self.token_req = torch.repeat_interleave(
             torch.arange(len(seq_lens), dtype=torch.int32), torch.tensor(seq_lens)
         ).to(device, non_blocking=True)
-        starts = kv.request_starts(md)
-        positions = positions.to(torch.int32)
-        tables = {True: kv.page_table(md, sliding=True), False: kv.page_table(md, sliding=False)}
-        blocks = {}
+        self.blocks = {}
         for head_dim in (HEAD_DIM_SLIDING, HEAD_DIM_FULL):
+            # The prefill block size also for the kept rows of the KV-shared layers (one row per context
+            # block): a row then sees the same tiles, masks and accumulation order as in the full pass.
             tpb = paged_attention.tokens_per_block(NUM_HEADS, head_dim)
-            blocks[head_dim] = (request_blocks(seq_lens, tpb, device), tpb)
+            self.blocks[head_dim] = (request_blocks(seq_lens, tpb, device), tpb)
 
-        proj = (hidden @ w["ple_model_proj_w"].t()) * (HIDDEN**-0.5)
-        proj = _rms(proj.view(num_tokens, NUM_LAYERS, PLE_DIM), w["ple_proj_norm_w"])
-        ple = (proj + ple_tokens) * (2.0**-0.5)
 
-        h = hidden
-        for i in range(NUM_LAYERS):
-            kind, j = layer_kind(i)
-            k = kind.lower()
-            head_dim = head_dim_of(i)
-            sliding = head_dim == HEAD_DIM_SLIDING
-            scales = w[f"{k}_scales"][j]
-            norms = w["layer_norm_w"][i]
-            x = _rms(h, norms[0])
-            if kind in "AB":
-                qkv = _fp8_linear(x, w[f"{k}_qkv_w"][j], scales[0, 0], scales[0, 1])
-                q_size = NUM_HEADS * head_dim
-                cos, sin = rope.tables[head_dim]
-                q = qk_norm_rope(
-                    qkv[:, :q_size].view(num_tokens, NUM_HEADS, head_dim), w[f"{k}_qk_norm_w"][j, 0], cos, sin,
-                    positions, EPS,
-                )  # fmt: skip
-                key = qk_norm_rope(
-                    qkv[:, q_size : q_size + head_dim].view(num_tokens, 1, head_dim), w[f"{k}_qk_norm_w"][j, 1],
-                    cos, sin, positions, EPS,
-                )[:, 0]  # fmt: skip
-                value = _rms(qkv[:, q_size + head_dim :])
-                paged_kv_append(
-                    key, value, kv.caches[i], tables[sliding], starts, token_req, positions
-                )
-                cache = kv.caches[i]
-                o_row = 1
-            else:
-                cos, sin = rope.tables[head_dim]
-                q = (x @ w[f"{k}_q_w"][j].t()).view(num_tokens, NUM_HEADS, head_dim)
-                q = qk_norm_rope(q, w[f"{k}_q_norm_w"][j], cos, sin, positions, EPS)
-                cache = kv.caches[KV_SOURCE_SLIDING if sliding else KV_SOURCE_FULL]
-                o_row = 0
-            block_table, tpb = blocks[head_dim]
-            attn = paged_attention(
-                q,
-                cache,
-                tables[sliding],
-                starts,
-                token_req,
-                positions,
-                block_table,
-                tpb,
-                SLIDING_WINDOW if sliding else 0,
+def shared_kv_rows(seq_lens: list[int], num_contexts: int) -> tuple[list[int], list[int]] | None:
+    """The rows the KV-shared layers (15-34) must compute, and the per-request row counts among them.
+
+    Layers 15-34 write no KV (they read layers 13 / 14), so a context request's prompt rows feed nothing after
+    layer 14 but its last row: the first-token logits and the assistant's recurrent hidden state. Generation rows
+    are all kept (each one is a verify/decode logits row). ``None`` when every row is kept.
+    """
+    if num_contexts == 0 or all(n == 1 for n in seq_lens[:num_contexts]):
+        return None
+    rows, start = [], 0
+    for r, n in enumerate(seq_lens):
+        if r < num_contexts:
+            rows.append(start + n - 1)
+        else:
+            rows.extend(range(start, start + n))
+        start += n
+    return rows, [1] * num_contexts + list(seq_lens[num_contexts:])
+
+
+def prefill_layers(
+    w,
+    rope: _Rope,
+    caches: list[torch.Tensor],
+    tables: dict[bool, torch.Tensor],
+    starts: torch.Tensor,
+    seq_lens: list[int],
+    num_contexts: int,
+    hidden: torch.Tensor,
+    ple_tokens: torch.Tensor,
+    positions: torch.Tensor,
+    skip_shared_kv_layers: bool = True,
+) -> torch.Tensor:
+    """The 35 decoder layers and the final norm, layer by layer, over requests laid out back to back (contexts
+    first); appends the new K/V of layers 0-14 to the paged caches and returns the final hidden states ``[T, 1536]``.
+
+    With ``skip_shared_kv_layers`` the KV-shared layers 15-34 run only on the rows ``shared_kv_rows`` keeps (the
+    last row of each context request and every generation row); the other rows of the result are zero. Those are
+    the only rows the step reads (logits and the drafter's input), and every row's KV comes from layers 0-14, so
+    the cache bytes are the same either way.
+    """
+    num_tokens = hidden.shape[0]
+    device = hidden.device
+    assert sum(seq_lens) == num_tokens, (seq_lens, num_tokens)
+    positions = positions.to(torch.int32)
+    step = _StepRows(seq_lens, device)
+    subset = shared_kv_rows(seq_lens, num_contexts) if skip_shared_kv_layers else None
+    keep = None
+
+    proj = (hidden @ w["ple_model_proj_w"].t()) * (HIDDEN**-0.5)
+    proj = _rms(proj.view(num_tokens, NUM_LAYERS, PLE_DIM), w["ple_proj_norm_w"])
+    ple = (proj + ple_tokens) * (2.0**-0.5)
+
+    h = hidden
+    for i in range(NUM_LAYERS):
+        if i == _NUM_KV_LAYERS and subset is not None:
+            keep = torch.tensor(subset[0], dtype=torch.long).to(device, non_blocking=True)
+            h, ple, positions = h[keep], ple[keep], positions[keep]
+            step = _StepRows(subset[1], device)
+        rows = step.num_rows
+        kind, j = layer_kind(i)
+        k = kind.lower()
+        head_dim = head_dim_of(i)
+        sliding = head_dim == HEAD_DIM_SLIDING
+        scales = w[f"{k}_scales"][j]
+        norms = w["layer_norm_w"][i]
+        x = _rms(h, norms[0])
+        if kind in "AB":
+            qkv = _fp8_linear(x, w[f"{k}_qkv_w"][j], scales[0, 0], scales[0, 1])
+            q_size = NUM_HEADS * head_dim
+            cos, sin = rope.tables[head_dim]
+            q = qk_norm_rope(
+                qkv[:, :q_size].view(rows, NUM_HEADS, head_dim), w[f"{k}_qk_norm_w"][j, 0], cos, sin,
+                positions, EPS,
+            )  # fmt: skip
+            key = qk_norm_rope(
+                qkv[:, q_size : q_size + head_dim].view(rows, 1, head_dim), w[f"{k}_qk_norm_w"][j, 1],
+                cos, sin, positions, EPS,
+            )[:, 0]  # fmt: skip
+            value = _rms(qkv[:, q_size + head_dim :])
+            paged_kv_append(
+                key, value, caches[i], tables[sliding], starts, step.token_req, positions
             )
-            o = _fp8_linear(
-                attn.view(num_tokens, -1), w[f"{k}_o_w"][j], scales[o_row, 0], scales[o_row, 1]
-            )
-            h = _rms(o, norms[1], h)
-            gate_up = _fp8_linear(
-                _rms(h, norms[2]), w[f"{k}_gu_w"][j], scales[o_row + 1, 0], scales[o_row + 1, 1]
-            )
-            down = _fp8_gemm(
-                gelu_tanh_mul_fp8(gate_up, scales[o_row + 2, 1]),
-                w[f"{k}_down_w"][j],
-                scales[o_row + 2, 0],
-                scales[o_row + 2, 1],
-            )
-            h = _rms(down, norms[3], h)
-            gate = F.gelu(h @ w["ple_gate_w"][i].t(), approximate="tanh") * ple[:, i]
-            h = _rms(gate @ w["ple_proj_w"][i].t(), norms[4], h)
-            h = (h.float() * w["layer_scalar"][i]).to(torch.bfloat16)
-        return _rms(h, w["final_norm_w"])
+            cache = caches[i]
+            o_row = 1
+        else:
+            cos, sin = rope.tables[head_dim]
+            q = (x @ w[f"{k}_q_w"][j].t()).view(rows, NUM_HEADS, head_dim)
+            q = qk_norm_rope(q, w[f"{k}_q_norm_w"][j], cos, sin, positions, EPS)
+            cache = caches[KV_SOURCE_SLIDING if sliding else KV_SOURCE_FULL]
+            o_row = 0
+        block_table, tpb = step.blocks[head_dim]
+        attn = paged_attention(
+            q,
+            cache,
+            tables[sliding],
+            starts,
+            step.token_req,
+            positions,
+            block_table,
+            tpb,
+            SLIDING_WINDOW if sliding else 0,
+        )
+        o = _fp8_linear(attn.view(rows, -1), w[f"{k}_o_w"][j], scales[o_row, 0], scales[o_row, 1])
+        h = _rms(o, norms[1], h)
+        gate_up = _fp8_linear(
+            _rms(h, norms[2]), w[f"{k}_gu_w"][j], scales[o_row + 1, 0], scales[o_row + 1, 1]
+        )
+        down = _fp8_gemm(
+            gelu_tanh_mul_fp8(gate_up, scales[o_row + 2, 1]),
+            w[f"{k}_down_w"][j],
+            scales[o_row + 2, 0],
+            scales[o_row + 2, 1],
+        )
+        h = _rms(down, norms[3], h)
+        gate = F.gelu(h @ w["ple_gate_w"][i].t(), approximate="tanh") * ple[:, i]
+        h = _rms(gate @ w["ple_proj_w"][i].t(), norms[4], h)
+        h = (h.float() * w["layer_scalar"][i]).to(torch.bfloat16)
+    h = _rms(h, w["final_norm_w"])
+    if keep is None:
+        return h
+    return h.new_zeros(num_tokens, HIDDEN).index_copy_(0, keep, h)
 
 
 # ---------------------------------------------------------------------------
@@ -796,6 +872,9 @@ class ModelingV2Gemma4E2bItFp8Sm120Tp1(DecoderModelForCausalLM):
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            # With MTP the engine always asks for context logits (it has gather_ids); the fused step reads only the
+            # gather_ids rows and each request's draft row, which the prefill keeps.
+            all_rows=return_context_logits and (self.mtp_step is None or spec_metadata is None),
         )
         if attn_metadata.padded_num_tokens is not None:
             hidden = hidden[: attn_metadata.num_tokens]
