@@ -14,8 +14,10 @@ double-wide MLP.
   launch of the decoder-stack megakernel (``ops/decode_stack.py``, native code in ``csrc/``) computes the PLE
   projection, the 35 layers and the final norm, reading and writing the paged FP8 KV in place.
 * Everything else (prefill, mixed batches): the same math layer by layer with PyTorch ops, FP8 ``_scaled_mm``
-  and this target's Triton paged-KV append and attention (``ops/paged_kv.py``). Layers 15-34 write no KV, so
-  they run only on the rows the step reads: each context request's last prompt row and the generation rows.
+  and this target's Triton paged-KV append and attention (``ops/paged_kv.py``); the context requests' rows attend
+  with FlashInfer's batch prefill (``ops/flashinfer_prefill.py``, called directly and planned per step with the
+  host-known prompt lengths). Layers 15-34 write no KV, so they run only on the rows the step reads: each context
+  request's last prompt row and the generation rows.
 
 **Speculative decoding runs in the model.** With one-model MTP and the Gemma-4 assistant checkpoint
 (``Gemma4AssistantForCausalLM``: 4 Q-only layers of width 256 that read the target's committed KV of layers 13 and
@@ -24,8 +26,9 @@ double-wide MLP.
 speculation the forward returns logits. Routing (``../routing.py``) admits nothing else.
 
 **Attention metadata.** The engine prepares FlashInfer metadata (Gemma-4's default on this GPU); the target reads
-only its per-pool page tables and page offsets and never plans or calls a FlashInfer wrapper, so the FlashInfer
-restrictions on SM120 (draft views and reservation-width page tables need trtllm-gen) do not apply. Token
+only its per-pool page tables and page offsets and never plans or calls the backend's FlashInfer wrappers, so the
+FlashInfer restrictions on SM120 (draft views and reservation-width page tables need trtllm-gen) do not apply. Its
+own FlashInfer prefill serves context rows only, planned with their exact lengths (no runtime KV length). Token
 positions come from ``position_ids``, which the engine corrects on the device under the overlap scheduler. The
 draft chain leaves the metadata untouched (it never runs the engine's attention).
 """
@@ -74,6 +77,7 @@ from .ops.decode_stack import (
     rope_inv_freq,
 )
 from .ops.elementwise import gelu_tanh_mul_fp8, qk_norm_rope, quantize_fp8
+from .ops.flashinfer_prefill import PrefillPlan, flashinfer_paged_prefill
 from .ops.norm import rms_norm
 from .ops.paged_kv import paged_attention, paged_kv_append, request_blocks
 
@@ -233,6 +237,8 @@ def _check_metadata_surface(md: AttentionMetadata) -> None:
         "paged_kv_indptr_decode",
         "paged_kv_indptr_prefill",
         "num_context_blocks",
+        "num_blocks",
+        "kv_cache_params",
         "num_contexts",
         "num_generations",
         "seq_lens",
@@ -267,6 +273,9 @@ class Gemma4E2bModel(DecoderModel):
         self._validate = step_contract_enabled()
         # Prefill runs the KV-shared layers 15-34 on the rows the step reads only (``shared_kv_rows``).
         self.skip_shared_kv_layers = True
+        # Context rows attend with FlashInfer's batch prefill (planned per step from host lengths).
+        self.flashinfer_prefill = True
+        self._prefill_plans: dict[tuple[int, bool], PrefillPlan] | None = None
 
     def post_load_weights(self) -> None:
         device = self.w["embed_tokens"].device
@@ -350,6 +359,37 @@ class Gemma4E2bModel(DecoderModel):
 
     # -- prefill / mixed: layer by layer -------------------------------------
 
+    def _plan_prefill(self, md, kv: _KvView, tables) -> dict[tuple[int, bool], PrefillPlan] | None:
+        """FlashInfer plans of the step's context requests, keyed (head_dim, last row only): every prompt row
+        (layers 0-14) and each context's last row (layers 15-34 under the skip). None without contexts."""
+        num_contexts = md.num_contexts
+        if not self.flashinfer_prefill or num_contexts == 0:
+            return None
+        if self._prefill_plans is None:
+            device = kv.caches[0].device
+            self._prefill_plans = {
+                (head_dim, last): PrefillPlan(
+                    NUM_HEADS,
+                    head_dim,
+                    SLIDING_WINDOW if head_dim == HEAD_DIM_SLIDING else 0,
+                    kv.page_size,
+                    device,
+                )
+                for head_dim in (HEAD_DIM_SLIDING, HEAD_DIM_FULL)
+                for last in (False, True)
+            }
+        # Host lengths: no chunked prefill and no block reuse are routed, but the cached prefix is honored.
+        q_lens = md.seq_lens[:num_contexts].tolist()
+        cached = md.kv_cache_params.num_cached_tokens_per_seq[:num_contexts]
+        kv_lens = [c + n for c, n in zip(cached, q_lens)]
+        page_counts = list(md.num_blocks[:num_contexts])
+        for (head_dim, last), plan in self._prefill_plans.items():
+            if last and not self.skip_shared_kv_layers:
+                continue
+            plan.plan([1] * num_contexts if last else q_lens, kv_lens, page_counts,
+                      tables[head_dim == HEAD_DIM_SLIDING])  # fmt: skip
+        return self._prefill_plans
+
     def _layers(self, md, kv: _KvView, hidden, ple_tokens, positions, all_rows) -> torch.Tensor:
         tables = {True: kv.page_table(md, sliding=True), False: kv.page_table(md, sliding=False)}
         return prefill_layers(
@@ -364,24 +404,27 @@ class Gemma4E2bModel(DecoderModel):
             ple_tokens,
             positions,
             skip_shared_kv_layers=self.skip_shared_kv_layers and not all_rows,
+            prefill_plans=self._plan_prefill(md, kv, tables),
         )
 
 
 class _StepRows:
     """The host-built row layout of one layer-by-layer pass: each row's request and, per head_dim, the attention
-    block table and its tokens per block."""
+    block table, its tokens per block and how many of its blocks belong to the first ``num_contexts`` requests."""
 
-    def __init__(self, seq_lens: list[int], device: torch.device):
+    def __init__(self, seq_lens: list[int], device: torch.device, num_contexts: int = 0):
         self.num_rows = sum(seq_lens)
         self.token_req = torch.repeat_interleave(
             torch.arange(len(seq_lens), dtype=torch.int32), torch.tensor(seq_lens)
         ).to(device, non_blocking=True)
         self.blocks = {}
+        self.context_blocks = {}
         for head_dim in (HEAD_DIM_SLIDING, HEAD_DIM_FULL):
             # The prefill block size also for the kept rows of the KV-shared layers (one row per context
             # block): a row then sees the same tiles, masks and accumulation order as in the full pass.
             tpb = paged_attention.tokens_per_block(NUM_HEADS, head_dim)
             self.blocks[head_dim] = (request_blocks(seq_lens, tpb, device), tpb)
+            self.context_blocks[head_dim] = sum(-(-n // tpb) for n in seq_lens[:num_contexts])
 
 
 def shared_kv_rows(seq_lens: list[int], num_contexts: int) -> tuple[list[int], list[int]] | None:
@@ -415,6 +458,7 @@ def prefill_layers(
     ple_tokens: torch.Tensor,
     positions: torch.Tensor,
     skip_shared_kv_layers: bool = True,
+    prefill_plans: dict[tuple[int, bool], PrefillPlan] | None = None,
 ) -> torch.Tensor:
     """The 35 decoder layers and the final norm, layer by layer, over requests laid out back to back (contexts
     first); appends the new K/V of layers 0-14 to the paged caches and returns the final hidden states ``[T, 1536]``.
@@ -423,12 +467,16 @@ def prefill_layers(
     last row of each context request and every generation row); the other rows of the result are zero. Those are
     the only rows the step reads (logits and the drafter's input), and every row's KV comes from layers 0-14, so
     the cache bytes are the same either way.
+
+    With ``prefill_plans`` (``Gemma4E2bModel._plan_prefill``), the context rows attend with FlashInfer's batch
+    prefill (lengths known on the host, so planned exactly) and only the generation rows of a mixed step with the
+    Triton kernel.
     """
     num_tokens = hidden.shape[0]
     device = hidden.device
     assert sum(seq_lens) == num_tokens, (seq_lens, num_tokens)
     positions = positions.to(torch.int32)
-    step = _StepRows(seq_lens, device)
+    step = _StepRows(seq_lens, device, num_contexts)
     subset = shared_kv_rows(seq_lens, num_contexts) if skip_shared_kv_layers else None
     keep = None
 
@@ -441,7 +489,7 @@ def prefill_layers(
         if i == _NUM_KV_LAYERS and subset is not None:
             keep = torch.tensor(subset[0], dtype=torch.long).to(device, non_blocking=True)
             h, ple, positions = h[keep], ple[keep], positions[keep]
-            step = _StepRows(subset[1], device)
+            step = _StepRows(subset[1], device, num_contexts)
         rows = step.num_rows
         kind, j = layer_kind(i)
         k = kind.lower()
@@ -475,17 +523,40 @@ def prefill_layers(
             cache = caches[KV_SOURCE_SLIDING if sliding else KV_SOURCE_FULL]
             o_row = 0
         block_table, tpb = step.blocks[head_dim]
-        attn = paged_attention(
-            q,
-            cache,
-            tables[sliding],
-            starts,
-            step.token_req,
-            positions,
-            block_table,
-            tpb,
-            SLIDING_WINDOW if sliding else 0,
-        )
+        window = SLIDING_WINDOW if sliding else 0
+        if prefill_plans is None:
+            attn = paged_attention(
+                q,
+                cache,
+                tables[sliding],
+                starts,
+                step.token_req,
+                positions,
+                block_table,
+                tpb,
+                window,
+            )
+        else:
+            plan = prefill_plans[(head_dim, keep is not None)]
+            ctx_rows = num_contexts if keep is not None else sum(seq_lens[:num_contexts])
+            if ctx_rows == rows:
+                attn = flashinfer_paged_prefill(plan, q, cache)
+            else:
+                # Generation rows of a mixed step: Triton over their blocks only (blocks never span requests,
+                # and the contexts' rows come first), then FlashInfer writes the context rows.
+                gen_blocks = block_table[step.context_blocks[head_dim] :]
+                attn = paged_attention(
+                    q,
+                    cache,
+                    tables[sliding],
+                    starts,
+                    step.token_req,
+                    positions,
+                    gen_blocks,
+                    tpb,
+                    window,
+                )
+                flashinfer_paged_prefill(plan, q[:ctx_rows], cache, out=attn[:ctx_rows])
         o = _fp8_linear(attn.view(rows, -1), w[f"{k}_o_w"][j], scales[o_row, 0], scales[o_row, 1])
         h = _rms(o, norms[1], h)
         gate_up = _fp8_linear(
