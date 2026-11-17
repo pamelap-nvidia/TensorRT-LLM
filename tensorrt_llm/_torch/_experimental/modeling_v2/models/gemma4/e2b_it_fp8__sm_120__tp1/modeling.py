@@ -688,6 +688,45 @@ class Gemma4AssistantDraft(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class DraftChainGraphs:
+    """CUDA graphs of the assistant's ``K``-step draft chain, for the steps the engine runs eagerly.
+
+    Decode steps are captured whole by the engine, but a prefill or mixed step runs the forward eagerly, and its
+    draft chain is ~80 small launches per draft step: host-bound, about 1.3 ms per step on top of a GPU-bound
+    prefill, so ~6 ms of TTFT at K=5 and batch 1. One graph per ``key`` (the caller's: request count, ``K`` and the
+    addresses of the tensors ``chain`` reads besides its inputs), captured on first use. The inputs are copied into
+    the graph's static buffers; the result is cloned out (a later replay reuses the buffer). Same kernels on the
+    same shapes as the eager chain, so the drafts are the same.
+    """
+
+    def __init__(self) -> None:
+        self._graphs: dict[
+            tuple, tuple[torch.cuda.CUDAGraph, dict[str, torch.Tensor], torch.Tensor]
+        ] = {}
+        self._pool = None
+
+    def __call__(self, chain, inputs: dict[str, torch.Tensor], key: tuple) -> torch.Tensor:
+        key = key + tuple((name, tuple(t.shape), t.dtype) for name, t in inputs.items())
+        entry = self._graphs.get(key)
+        if entry is None:
+            static = {name: t.clone() for name, t in inputs.items()}
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                chain(**static)  # Triton compilation and cuBLAS handles happen outside the capture
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=self._pool, capture_error_mode="thread_local"):
+                out = chain(**static)
+            self._pool = graph.pool()
+            entry = self._graphs[key] = (graph, static, out)
+        graph, static, out = entry
+        for name, t in inputs.items():
+            static[name].copy_(t)
+        graph.replay()
+        return out.clone()
+
+
 class Gemma4MtpStep:
     """One engine step of one-model MTP with the Gemma-4 assistant, after the target decoder ran.
 
@@ -697,7 +736,14 @@ class Gemma4MtpStep:
        prompt token when its chunk is not the last) and the target's final hidden state of that row; the draft
        position is one past it and stays fixed across steps; the queries read the committed KV only.
     3. Return what the speculative sampler reads. Shapes depend on (batch size, contexts, K) only.
+
+    In the steps the engine runs eagerly (prefill and mixed batches) the draft chain replays a CUDA graph
+    (``DraftChainGraphs``); captured decode steps run it inline.
     """
+
+    def __init__(self) -> None:
+        self.graph_draft_chain = True
+        self._draft_graphs = DraftChainGraphs()
 
     def __call__(
         self,
@@ -768,19 +814,39 @@ class Gemma4MtpStep:
         anchors = torch.minimum(
             positions, (kv.request_pages(md) * kv.page_size - 1).to(torch.int32)
         )
-        rows = torch.arange(batch_size, dtype=torch.int32, device=logits.device)
-        blocks = torch.stack([rows, rows + 1], 1)
         # The draft position (one past the last accepted token) is the same for every draft step and layer.
         draft_positions = (positions + 1).clamp(0, target.max_positions - 1)
-        rope = {hd: target._rope.at(draft_positions, hd) for hd in set(draft.head_dims)}
 
-        drafts = []
-        for _ in range(draft_len):
-            tokens, hidden = draft.step(
-                tokens, hidden, rope, target, kv, tables, starts, rows, anchors, blocks
+        def chain(tokens, hidden, starts, anchors, draft_positions):
+            rows = torch.arange(tokens.shape[0], dtype=torch.int32, device=tokens.device)
+            blocks = torch.stack([rows, rows + 1], 1)
+            rope = {hd: target._rope.at(draft_positions, hd) for hd in set(draft.head_dims)}
+            drafts = []
+            for _ in range(draft_len):
+                tokens, hidden = draft.step(
+                    tokens, hidden, rope, target, kv, tables, starts, rows, anchors, blocks
+                )
+                drafts.append(tokens)
+            return torch.stack(drafts, 1)
+
+        inputs = dict(
+            tokens=tokens,
+            hidden=hidden,
+            starts=starts,
+            anchors=anchors,
+            draft_positions=draft_positions,
+        )
+        if self.graph_draft_chain and not torch.cuda.is_current_stream_capturing():
+            # The graph also bakes in the page tables' and caches' addresses (stable per KV manager / metadata).
+            key = (
+                batch_size,
+                draft_len,
+                *(table.data_ptr() for table in tables.values()),
+                *(cache.data_ptr() for cache in kv.caches),
             )
-            drafts.append(tokens)
-        next_draft_tokens = torch.stack(drafts, 1)
+            next_draft_tokens = self._draft_graphs(chain, inputs, key)
+        else:
+            next_draft_tokens = chain(**inputs)
         last_accepted = accepted_tokens[batch_rows, num_accepted.long() - 1]
         next_new_tokens = torch.cat(
             [last_accepted.unsqueeze(1).to(torch.int32), next_draft_tokens], 1
